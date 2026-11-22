@@ -1,0 +1,22 @@
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  SQLX_OFFLINE: true
+
+jobs:
+  shear:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: namespace-profile-untrusted-tiny-arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: cargo-bins/cargo-binstall@851112458b5f28a29e5bc14a690c3f283d9dcc6f # v1.26.2
+      - run: cargo binstall --no-confirm --locked cargo-shear@1.13.0
+      - run: cargo shear

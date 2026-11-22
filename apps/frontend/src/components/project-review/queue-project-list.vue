@@ -1,0 +1,131 @@
+<template>
+	<div
+		class="flex max-h-[60dvh] w-72 max-w-[80vw] flex-col gap-2.5"
+		:class="{ 'h-[296px]': projectIds.length > 6 }"
+	>
+		<Input
+			v-if="projectIds.length > 6 || search"
+			v-model="search"
+			class="shrink-0"
+			placeholder="Search..."
+			aria-label="Search"
+			size="small"
+		/>
+		<div v-bind="containerProps" class="min-h-0 flex-1 overscroll-contain">
+			<span v-if="indexing" class="text-xs text-secondary">Searching projects…</span>
+			<span v-else-if="indexError && search.trim()" class="pt-1 text-xs text-secondary"
+				>Could not load project data</span
+			>
+			<span v-if="!filteredIds.length && !indexing" class="pt-1 text-secondary">{{
+				search.trim() ? 'No matching projects' : emptyMessage
+			}}</span>
+			<div v-bind="wrapperProps">
+				<div v-for="item in list" :key="item.data" class="flex h-8 items-center">
+					<QueueProjectPreview :project-id="item.data" />
+				</div>
+			</div>
+		</div>
+	</div>
+</template>
+
+<script setup lang="ts">
+import { injectModrinthClient, Input } from '@modrinth/ui'
+import { useQuery, useQueryClient } from '@tanstack/vue-query'
+import { refDebounced, useVirtualList } from '@vueuse/core'
+import { computed, onScopeDispose, shallowRef, watch } from 'vue'
+
+import {
+	type QueueProjectPreview as ProjectPreview,
+	queueProjectPreviewKey,
+	queueProjectPreviewOptions,
+	seedQueueProjectPreviews,
+} from './queue-project-cache'
+import QueueProjectPreview from './queue-project-preview.vue'
+
+const props = defineProps<{
+	projectIds: string[]
+	emptyMessage: string
+}>()
+const client = injectModrinthClient()
+const queryClient = useQueryClient()
+
+const search = defineModel<string>('search', { default: '' })
+const debouncedSearch = refDebounced(search, 250)
+const projects = shallowRef(new Map<string, ProjectPreview>())
+
+function readCachedProjects() {
+	projects.value = new Map(
+		props.projectIds.flatMap((id) => {
+			const project = queryClient.getQueryData<ProjectPreview>(queueProjectPreviewKey(id))
+			return project ? [[id, project] as const] : []
+		}),
+	)
+}
+
+watch(
+	() => props.projectIds,
+	(ids) => {
+		seedQueueProjectPreviews(queryClient, ids)
+		readCachedProjects()
+	},
+	{ immediate: true },
+)
+const unsubscribe = queryClient.getQueryCache().subscribe((event) => {
+	if (
+		event.type === 'updated' &&
+		event.action.type === 'success' &&
+		event.query.queryKey[1] === 'queue-preview'
+	) {
+		readCachedProjects()
+	}
+})
+onScopeDispose(unsubscribe)
+
+const filteredIds = computed(() => {
+	const term = search.value.trim().toLocaleLowerCase()
+	if (!term) return props.projectIds
+	return props.projectIds.filter(
+		(id) =>
+			id.toLocaleLowerCase().includes(term) ||
+			projects.value.get(id)?.name.toLocaleLowerCase().includes(term),
+	)
+})
+const { list, containerProps, wrapperProps, scrollTo } = useVirtualList(filteredIds, {
+	itemHeight: 32,
+	overscan: 2,
+})
+watch(search, () => scrollTo(0))
+
+const { isFetching: indexing, isError: indexError } = useQuery(
+	computed(() => ({
+		queryKey: [
+			'moderation',
+			'queue-search-index',
+			props.projectIds,
+			!!debouncedSearch.value.trim(),
+		] as const,
+		enabled: !!debouncedSearch.value.trim(),
+		staleTime: 0,
+		retry: false,
+		queryFn: async ({ signal }: { signal: AbortSignal }) => {
+			const missing = props.projectIds.filter((id) => !projects.value.has(id))
+			let failure: unknown
+			for (let offset = 0; offset < missing.length; offset += 5) {
+				signal.throwIfAborted()
+				const results = await Promise.allSettled(
+					missing
+						.slice(offset, offset + 5)
+						.map((id) =>
+							queryClient.ensureQueryData(queueProjectPreviewOptions(id, client, queryClient)),
+						),
+				)
+				for (const result of results) {
+					if (result.status === 'rejected') failure = result.reason
+				}
+			}
+			if (failure) throw failure
+			return true
+		},
+	})),
+)
+</script>

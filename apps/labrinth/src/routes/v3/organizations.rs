@@ -1,0 +1,1537 @@
+use crate::util::error::ApiContext as _;
+use anyhow::anyhow;
+use std::collections::HashMap;
+
+use super::ApiError;
+use crate::auth::checks::is_visible_organization;
+use crate::auth::{
+    filter_visible_projects, get_user_from_headers, require_verified_email,
+};
+use crate::database::PgPool;
+use crate::database::models::team_item::DBTeamMember;
+use crate::database::models::{
+    DBModerationNote, DBOrganization, generate_organization_id, team_item,
+};
+use crate::file_hosting::{FileHost, FileHostPublicity};
+use crate::models::ids::OrganizationId;
+use crate::models::pats::Scopes;
+use crate::models::teams::{OrganizationPermissions, ProjectPermissions};
+use crate::models::v3::user_limits::UserLimits;
+use crate::queue::session::AuthQueue;
+use crate::routes::internal::globals::GLOBALS;
+use crate::routes::v3::project_creation::CreateError;
+use crate::search::SearchState;
+use crate::util::error::Context;
+use crate::util::img::delete_old_images;
+use crate::util::routes::read_limited_from_payload;
+use crate::util::validate::validation_errors_to_string;
+use crate::{database, models};
+use actix_web::{HttpRequest, HttpResponse, delete, get, patch, post, web};
+use ariadne::ids::UserId;
+use futures::TryStreamExt;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use validator::Validate;
+use xredis::RedisPool;
+
+pub fn config(cfg: &mut actix_web::web::ServiceConfig) {
+    cfg.service(organizations_get)
+        .service(organization_create)
+        .service(organization_projects_get)
+        .service(organization_notes_edit)
+        .service(organization_get)
+        .service(organizations_edit)
+        .service(organization_delete)
+        .service(organization_projects_add)
+        .service(organization_projects_remove)
+        .service(organization_icon_edit)
+        .service(delete_organization_icon);
+}
+
+#[utoipa::path(tag = "organizations", responses((status = OK)))]
+#[get("/organization/{id}/projects")]
+pub async fn organization_projects_get(
+    req: HttpRequest,
+    info: web::Path<(String,)>,
+    pool: web::Data<PgPool>,
+    redis: web::Data<RedisPool>,
+    session_queue: web::Data<AuthQueue>,
+) -> Result<HttpResponse, ApiError> {
+    let id = info.into_inner().0;
+    let current_user = get_user_from_headers(
+        &req,
+        &**pool,
+        &redis,
+        &session_queue,
+        Scopes::ORGANIZATION_READ | Scopes::PROJECT_READ,
+    )
+    .await
+    .ok();
+
+    let organization_data = DBOrganization::get(&id, &**pool, &redis)
+        .await
+        .internal_context("fetching organization from database")?;
+    if let Some(organization) = organization_data
+        && is_visible_organization(&organization, &current_user, &pool, &redis)
+            .await
+            .api_context("checking organization visibility")?
+    {
+        let project_ids = sqlx::query!(
+            "
+            SELECT m.id FROM organizations o
+            INNER JOIN mods m ON m.organization_id = o.id
+            WHERE o.id = $1
+            ",
+            organization.id as database::models::ids::DBOrganizationId
+        )
+        .fetch(&**pool)
+        .map_ok(|m| database::models::DBProjectId(m.id))
+        .try_collect::<Vec<_>>()
+        .await
+        .internal_context("fetching project IDs from database")?;
+
+        let projects_data = crate::database::models::DBProject::get_many_ids(
+            &project_ids,
+            &**pool,
+            &redis,
+        )
+        .await
+        .internal_context("fetching organization projects")?;
+
+        let projects =
+            filter_visible_projects(projects_data, &current_user, &pool, true)
+                .await
+                .api_context("filtering visible projects")?;
+
+        Ok(HttpResponse::Ok().json(projects))
+    } else {
+        Err(ApiError::NotFound(anyhow!("resource not found")))
+    }
+}
+
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+pub struct NewOrganization {
+    #[validate(
+        length(min = 3, max = 64),
+        regex(path = *crate::util::validate::RE_URL_SAFE)
+    )]
+    pub slug: String,
+    // Title of the organization
+    #[validate(length(min = 3, max = 64))]
+    pub name: String,
+    #[validate(length(min = 3, max = 256))]
+    pub description: String,
+}
+
+#[utoipa::path(tag = "organizations", responses((status = OK)))]
+#[post("/organization")]
+pub async fn organization_create(
+    req: HttpRequest,
+    new_organization: web::Json<NewOrganization>,
+    pool: web::Data<PgPool>,
+    redis: web::Data<RedisPool>,
+    session_queue: web::Data<AuthQueue>,
+) -> Result<HttpResponse, CreateError> {
+    let current_user = get_user_from_headers(
+        &req,
+        &**pool,
+        &redis,
+        &session_queue,
+        Scopes::ORGANIZATION_CREATE,
+    )
+    .await?;
+
+    require_verified_email(&current_user.user)?;
+
+    let limits =
+        UserLimits::get_for_organizations(&current_user, &pool).await?;
+    if limits.current >= limits.max {
+        return Err(CreateError::LimitReached);
+    }
+
+    new_organization.validate().map_err(|err| {
+        CreateError::ValidationError(validation_errors_to_string(err, None))
+    })?;
+
+    let mut transaction = pool.begin().await?;
+
+    // Try title
+    let name_organization_id_option: Option<OrganizationId> =
+        serde_json::from_str(&format!("\"{}\"", new_organization.slug)).ok();
+    let mut organization_strings = vec![];
+    if let Some(name_organization_id) = name_organization_id_option {
+        organization_strings.push(name_organization_id.to_string());
+    }
+    organization_strings.push(new_organization.slug.clone());
+    let results = DBOrganization::get_many(
+        &organization_strings,
+        &mut transaction,
+        &redis,
+    )
+    .await?;
+    if !results.is_empty() {
+        return Err(CreateError::SlugCollision);
+    }
+
+    let organization_id = generate_organization_id(&mut transaction).await?;
+
+    // Create organization managerial team
+    let team = team_item::TeamBuilder {
+        members: vec![team_item::TeamMemberBuilder {
+            user_id: current_user.user.id.into(),
+            role: crate::models::teams::DEFAULT_ROLE.to_owned(),
+            is_owner: true,
+            permissions: ProjectPermissions::all(),
+            organization_permissions: Some(OrganizationPermissions::all()),
+            accepted: true,
+            payouts_split: Decimal::ONE_HUNDRED,
+            ordering: 0,
+        }],
+    };
+    let team_id = team.insert(&mut transaction).await?;
+
+    // Create organization
+    let organization = DBOrganization {
+        id: organization_id,
+        slug: new_organization.slug.clone(),
+        name: new_organization.name.clone(),
+        description: new_organization.description.clone(),
+        team_id,
+        icon_url: None,
+        raw_icon_url: None,
+        color: None,
+    };
+    organization.clone().insert(&mut transaction).await?;
+    transaction.commit().await?;
+
+    // Only member is the owner, the logged in one
+    let member_data =
+        DBTeamMember::get_from_team_full(team_id, &**pool, &redis)
+            .await?
+            .into_iter()
+            .next();
+    let members_data = if let Some(member_data) = member_data {
+        vec![crate::models::teams::TeamMember::from_model(
+            member_data,
+            current_user.user.clone(),
+            false,
+        )]
+    } else {
+        return Err(CreateError::InvalidInput(
+            "Failed to get created team.".to_owned(), // should never happen
+        ));
+    };
+
+    let organization =
+        models::organizations::Organization::from(organization, members_data);
+
+    Ok(HttpResponse::Ok().json(organization))
+}
+
+#[utoipa::path(tag = "organizations", responses((status = OK)))]
+#[get("/organization/{id}")]
+pub async fn organization_get(
+    req: HttpRequest,
+    info: web::Path<(String,)>,
+    pool: web::Data<PgPool>,
+    redis: web::Data<RedisPool>,
+    session_queue: web::Data<AuthQueue>,
+) -> Result<HttpResponse, ApiError> {
+    let id = info.into_inner().0;
+    let current_user = get_user_from_headers(
+        &req,
+        &**pool,
+        &redis,
+        &session_queue,
+        Scopes::ORGANIZATION_READ,
+    )
+    .await
+    .ok();
+    let user_id = current_user.as_ref().map(|x| x.user.id.into());
+
+    let organization_data = DBOrganization::get(&id, &**pool, &redis)
+        .await
+        .internal_context("fetching organization from database")?;
+    if let Some(data) = organization_data
+        && is_visible_organization(&data, &current_user, &pool, &redis)
+            .await
+            .api_context("checking organization visibility")?
+    {
+        let members_data =
+            DBTeamMember::get_from_team_full(data.team_id, &**pool, &redis)
+                .await
+                .internal_context("fetching team members from database")?;
+
+        let users = crate::database::models::DBUser::get_many_ids(
+            &members_data.iter().map(|x| x.user_id).collect::<Vec<_>>(),
+            &**pool,
+            &redis,
+        )
+        .await
+        .internal_context("fetching users from database")?;
+        let logged_in = current_user
+            .as_ref()
+            .and_then(|user| {
+                members_data
+                    .iter()
+                    .find(|x| x.user_id == user.user.id.into() && x.accepted)
+            })
+            .is_some();
+        let team_members: Vec<_> = members_data
+            .into_iter()
+            .filter(|x| {
+                logged_in
+                    || x.accepted
+                    || user_id.is_some_and(
+                        |y: crate::database::models::DBUserId| y == x.user_id,
+                    )
+            })
+            .filter_map(|data| {
+                users.iter().find(|x| x.id == data.user_id).map(|user| {
+                    crate::models::teams::TeamMember::from(
+                        data,
+                        user.clone(),
+                        !logged_in,
+                    )
+                })
+            })
+            .collect();
+
+        let mut organization =
+            models::organizations::Organization::from(data, team_members);
+        if current_user
+            .as_ref()
+            .is_some_and(|x| x.scopes.contains(Scopes::MODERATION_READ))
+        {
+            let note = DBModerationNote::get_organization(
+                organization.id.into(),
+                &**pool,
+                &redis,
+            )
+            .await
+            .internal_context("fetching moderation note from database")?;
+            organization.moderation_notes = Some(note.map(Into::into));
+        }
+        return Ok(HttpResponse::Ok().json(organization));
+    }
+    Err(ApiError::NotFound(anyhow!("resource not found")))
+}
+
+#[utoipa::path(tag = "organizations", responses((status = NO_CONTENT)))]
+#[patch("/organization/{id}/notes")]
+pub async fn organization_notes_edit(
+    req: HttpRequest,
+    info: web::Path<(String,)>,
+    new_note: web::Json<crate::models::moderation_notes::PatchModerationNote>,
+    pool: web::Data<PgPool>,
+    redis: web::Data<RedisPool>,
+    session_queue: web::Data<AuthQueue>,
+) -> Result<HttpResponse, ApiError> {
+    let user = get_user_from_headers(
+        &req,
+        &**pool,
+        &redis,
+        &session_queue,
+        Scopes::SESSION_ACCESS,
+    )
+    .await
+    .auth_context("authenticating API request")?;
+
+    if !user.scopes.contains(Scopes::MODERATION_WRITE) {
+        return Err(ApiError::Auth(anyhow!(
+            "you do not have permission to edit moderation notes",
+        )));
+    }
+
+    new_note
+        .validate_not_empty()
+        .api_context("validating not empty")?;
+    let expected_version =
+        crate::models::moderation_notes::parse_if_match_header(&req)
+            .api_context(
+                "executing `moderation_notes::parse_if_match_header`",
+            )?;
+
+    let organization =
+        DBOrganization::get(&info.into_inner().0, &**pool, &redis)
+            .await
+            .internal_context("fetching organization from database")?
+            .not_found_context("resource not found")?;
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .internal_context("starting database transaction")?;
+    if let Some(expected) = expected_version {
+        let updated = DBModerationNote::update(
+            None,
+            Some(organization.id),
+            user.user.id.into(),
+            expected,
+            new_note.notes.as_deref(),
+            new_note.user_rating,
+            &mut transaction,
+        )
+        .await
+        .internal_context("updating moderation note in database")?;
+
+        if updated.is_none() {
+            return Err(ApiError::PreconditionFailed(anyhow!(
+                "moderation note version does not match",
+            )));
+        }
+    } else {
+        let updated = DBModerationNote::insert(
+            None,
+            Some(organization.id),
+            user.user.id.into(),
+            new_note.notes.as_deref(),
+            new_note.user_rating,
+            &mut transaction,
+        )
+        .await
+        .internal_context("inserting moderation note into database")?;
+
+        if updated.is_none() {
+            return Err(ApiError::PreconditionRequired(anyhow!(
+                "moderation note version does not match",
+            )));
+        }
+    };
+
+    transaction
+        .commit()
+        .await
+        .internal_context("committing database transaction")?;
+    DBModerationNote::clear_organization_cache(organization.id, &redis)
+        .await
+        .internal_context("clearing cached moderation note in Redis")?;
+
+    Ok(HttpResponse::NoContent().finish())
+}
+
+#[derive(Deserialize)]
+pub struct OrganizationIds {
+    pub ids: String,
+}
+
+#[utoipa::path(
+	tag = "organizations",
+	params(("ids" = String, Query)),
+	responses((status = OK))
+)]
+#[get("/organizations")]
+pub async fn organizations_get(
+    req: HttpRequest,
+    web::Query(ids): web::Query<OrganizationIds>,
+    pool: web::Data<PgPool>,
+    redis: web::Data<RedisPool>,
+    session_queue: web::Data<AuthQueue>,
+) -> Result<HttpResponse, ApiError> {
+    let ids = serde_json::from_str::<Vec<&str>>(&ids.ids)
+        .request_context("deserializing JSON data")?;
+    let organizations_data = DBOrganization::get_many(&ids, &**pool, &redis)
+        .await
+        .internal_context("fetching organizations from database")?;
+    let team_ids = organizations_data
+        .iter()
+        .map(|x| x.team_id)
+        .collect::<Vec<_>>();
+
+    let teams_data =
+        DBTeamMember::get_from_team_full_many(&team_ids, &**pool, &redis)
+            .await
+            .internal_context("fetching team members from database")?;
+    let users = crate::database::models::DBUser::get_many_ids(
+        &teams_data.iter().map(|x| x.user_id).collect::<Vec<_>>(),
+        &**pool,
+        &redis,
+    )
+    .await
+    .internal_context("fetching users from database")?;
+
+    let current_user = get_user_from_headers(
+        &req,
+        &**pool,
+        &redis,
+        &session_queue,
+        Scopes::ORGANIZATION_READ,
+    )
+    .await
+    .ok();
+    let user_id = current_user.as_ref().map(|x| x.user.id.into());
+    let include_notes = current_user
+        .as_ref()
+        .is_some_and(|x| x.scopes.contains(Scopes::MODERATION_READ));
+    let notes = if include_notes {
+        DBModerationNote::get_many_organizations(
+            &organizations_data.iter().map(|x| x.id).collect::<Vec<_>>(),
+            &**pool,
+            &redis,
+        )
+        .await
+        .internal_context("fetching moderation notes from database")?
+    } else {
+        HashMap::new()
+    };
+
+    let mut organizations = vec![];
+
+    let mut team_groups = HashMap::new();
+    for item in teams_data {
+        team_groups.entry(item.team_id).or_insert(vec![]).push(item);
+    }
+
+    for data in organizations_data {
+        if !is_visible_organization(&data, &current_user, &pool, &redis)
+            .await
+            .api_context("checking organization visibility")?
+        {
+            continue;
+        }
+
+        let members_data = team_groups.remove(&data.team_id).unwrap_or(vec![]);
+        let logged_in = current_user
+            .as_ref()
+            .and_then(|user| {
+                members_data
+                    .iter()
+                    .find(|x| x.user_id == user.user.id.into() && x.accepted)
+            })
+            .is_some();
+
+        let team_members: Vec<_> = members_data
+            .into_iter()
+            .filter(|x| {
+                logged_in
+                    || x.accepted
+                    || user_id.is_some_and(
+                        |y: crate::database::models::DBUserId| y == x.user_id,
+                    )
+            })
+            .filter_map(|data| {
+                users.iter().find(|x| x.id == data.user_id).map(|user| {
+                    crate::models::teams::TeamMember::from(
+                        data,
+                        user.clone(),
+                        !logged_in,
+                    )
+                })
+            })
+            .collect();
+
+        let data_id = data.id;
+        let mut organization =
+            models::organizations::Organization::from(data, team_members);
+        if include_notes {
+            organization.moderation_notes =
+                Some(notes.get(&data_id).cloned().map(Into::into));
+        }
+        organizations.push(organization);
+    }
+
+    Ok(HttpResponse::Ok().json(organizations))
+}
+
+#[derive(Serialize, Deserialize, Validate, utoipa::ToSchema)]
+pub struct OrganizationEdit {
+    #[validate(length(min = 3, max = 256))]
+    pub description: Option<String>,
+    #[validate(
+        length(min = 3, max = 64),
+        regex(path = *crate::util::validate::RE_URL_SAFE)
+    )]
+    pub slug: Option<String>,
+    #[validate(length(min = 3, max = 64))]
+    pub name: Option<String>,
+}
+
+#[utoipa::path(tag = "organizations", responses((status = NO_CONTENT)))]
+#[patch("/organization/{id}")]
+pub async fn organizations_edit(
+    req: HttpRequest,
+    info: web::Path<(String,)>,
+    new_organization: web::Json<OrganizationEdit>,
+    pool: web::Data<PgPool>,
+    redis: web::Data<RedisPool>,
+    session_queue: web::Data<AuthQueue>,
+) -> Result<HttpResponse, ApiError> {
+    let user = get_user_from_headers(
+        &req,
+        &**pool,
+        &redis,
+        &session_queue,
+        Scopes::ORGANIZATION_WRITE,
+    )
+    .await
+    .auth_context("authenticating API request")?;
+
+    new_organization
+        .validate()
+        .map_err(|err| anyhow!(err))
+        .request_context("validating request")?;
+
+    let string = info.into_inner().0;
+    let result =
+        database::models::DBOrganization::get(&string, &**pool, &redis)
+            .await
+            .internal_context("fetching organization from database")?;
+    if let Some(organization_item) = result {
+        let id = organization_item.id;
+
+        let team_member = database::models::DBTeamMember::get_from_user_id(
+            organization_item.team_id,
+            user.user.id.into(),
+            &**pool,
+        )
+        .await
+        .internal_context("fetching team member from database")?;
+
+        let permissions = OrganizationPermissions::get_permissions_by_scopes(
+            user.scopes,
+            &team_member,
+        );
+
+        if let Some(perms) = permissions {
+            let mut transaction = pool
+                .begin()
+                .await
+                .internal_context("starting database transaction")?;
+            if let Some(description) = &new_organization.description {
+                if !perms.contains(OrganizationPermissions::EDIT_DETAILS) {
+                    return Err(ApiError::Auth(anyhow!(
+                        "You do not have the permissions to edit the description of this organization!",
+                    )));
+                }
+                sqlx::query!(
+                    "
+                    UPDATE organizations
+                    SET description = $1
+                    WHERE (id = $2)
+                    ",
+                    description,
+                    id as database::models::ids::DBOrganizationId,
+                )
+                .execute(&mut transaction)
+                .await
+                .internal_context(
+                    "querying database for `organizations_edit`",
+                )?;
+            }
+
+            if let Some(name) = &new_organization.name {
+                if !perms.contains(OrganizationPermissions::EDIT_DETAILS) {
+                    return Err(ApiError::Auth(anyhow!(
+                        "You do not have the permissions to edit the name of this organization!",
+                    )));
+                }
+                sqlx::query!(
+                    "
+                    UPDATE organizations
+                    SET name = $1
+                    WHERE (id = $2)
+                    ",
+                    name,
+                    id as database::models::ids::DBOrganizationId,
+                )
+                .execute(&mut transaction)
+                .await
+                .internal_context(
+                    "querying database for `organizations_edit`",
+                )?;
+            }
+
+            if let Some(slug) = &new_organization.slug {
+                if !perms.contains(OrganizationPermissions::EDIT_DETAILS) {
+                    return Err(ApiError::Auth(anyhow!(
+                        "You do not have the permissions to edit this organization's URL!",
+                    )));
+                }
+
+                let existing = DBOrganization::get(
+                    &slug.to_lowercase(),
+                    &mut transaction,
+                    &redis,
+                )
+                .await
+                .internal_context("fetching organization from database")?;
+                if existing.is_some() {
+                    return Err(ApiError::Request(anyhow!(
+                        "Your URL is already being used by another organization!",
+                    )));
+                }
+
+                // Make sure the new name is different from the old one
+                // We are able to unwrap here because the name is always set
+                if !slug.eq(&organization_item.slug.clone()) {
+                    let results = sqlx::query!(
+                        "
+                        SELECT EXISTS(
+                            SELECT 1 FROM organizations
+                            WHERE
+                                LOWER(slug) = LOWER($1)
+                                OR text_id_lower = LOWER($1)
+                        )
+                        ",
+                        slug
+                    )
+                    .fetch_one(&mut transaction)
+                    .await
+                    .internal_context(
+                        "querying database for `organizations_edit`",
+                    )?;
+
+                    if results.exists.unwrap_or(true) {
+                        return Err(ApiError::Request(anyhow!(
+                            "Your URL is already being used by another organization!",
+                        )));
+                    }
+                }
+
+                sqlx::query!(
+                    "
+                    UPDATE organizations
+                    SET slug = LOWER($1)
+                    WHERE (id = $2)
+                    ",
+                    Some(slug),
+                    id as database::models::ids::DBOrganizationId,
+                )
+                .execute(&mut transaction)
+                .await
+                .internal_context(
+                    "querying database for `organizations_edit`",
+                )?;
+            }
+
+            transaction
+                .commit()
+                .await
+                .internal_context("committing database transaction")?;
+            database::models::DBOrganization::clear_cache(
+                organization_item.id,
+                Some(organization_item.slug),
+                &redis,
+            )
+            .await
+            .internal_context("clearing cached data from Redis")?;
+
+            Ok(HttpResponse::NoContent().body(""))
+        } else {
+            Err(ApiError::Auth(anyhow!(
+                "You do not have permission to edit this organization!",
+            )))
+        }
+    } else {
+        Err(ApiError::NotFound(anyhow!("resource not found")))
+    }
+}
+
+#[utoipa::path(tag = "organizations", responses((status = NO_CONTENT)))]
+#[delete("/organization/{id}")]
+pub async fn organization_delete(
+    req: HttpRequest,
+    info: web::Path<(String,)>,
+    pool: web::Data<PgPool>,
+    redis: web::Data<RedisPool>,
+    session_queue: web::Data<AuthQueue>,
+    search_state: web::Data<SearchState>,
+) -> Result<HttpResponse, ApiError> {
+    let user = get_user_from_headers(
+        &req,
+        &**pool,
+        &redis,
+        &session_queue,
+        Scopes::ORGANIZATION_DELETE,
+    )
+    .await
+    .auth_context("authenticating API request")?;
+    let string = info.into_inner().0;
+
+    let organization =
+        database::models::DBOrganization::get(&string, &**pool, &redis)
+            .await
+            .internal_context("fetching organization from database")?
+            .request_context_with(|| {
+                "the specified organization does not exist!".to_string()
+            })?;
+
+    if !user.scopes.contains(Scopes::ADMIN_WRITE) {
+        let team_member =
+            database::models::DBTeamMember::get_from_user_id_organization(
+                organization.id,
+                user.user.id.into(),
+                false,
+                &**pool,
+            )
+            .await
+            .internal_context("fetching organization team member")?
+            .request_context_with(|| {
+                "the specified organization does not exist!".to_string()
+            })?;
+
+        let permissions = OrganizationPermissions::get_permissions_by_scopes(
+            user.scopes,
+            &Some(team_member),
+        )
+        .unwrap_or_default();
+
+        if !permissions.contains(OrganizationPermissions::DELETE_ORGANIZATION) {
+            return Err(ApiError::Auth(anyhow!(
+                "You don't have permission to delete this organization!",
+            )));
+        }
+    }
+
+    let owner_id = sqlx::query!(
+        "
+        SELECT user_id FROM team_members
+        WHERE team_id = $1 AND is_owner = TRUE
+        ",
+        organization.team_id as database::models::ids::DBTeamId
+    )
+    .fetch_one(&**pool)
+    .await
+    .internal_context("fetching owner ID from database")?
+    .user_id;
+    let owner_id = database::models::ids::DBUserId(owner_id);
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .internal_context("starting database transaction")?;
+
+    // Handle projects- every project that is in this organization needs to have its owner changed the organization owner
+    // Now, no project should have an owner if it is in an organization, and also
+    // the owner of an organization should not be a team member in any project
+    let organization_projects = sqlx::query!(
+        "
+        SELECT t.id team_id, m.id project_id FROM organizations o
+        INNER JOIN mods m ON m.organization_id = o.id
+        INNER JOIN teams t ON t.id = m.team_id
+        WHERE o.id = $1 AND $1 IS NOT NULL
+        ",
+        organization.id as database::models::ids::DBOrganizationId
+    )
+    .fetch(&mut transaction)
+    .map_ok(|c| {
+        (
+            database::models::DBTeamId(c.team_id),
+            database::models::DBProjectId(c.project_id),
+        )
+    })
+    .try_collect::<Vec<_>>()
+    .await
+    .internal_context("querying database for `organization_delete`")?;
+    let organization_project_teams = organization_projects
+        .iter()
+        .map(|(team_id, _)| *team_id)
+        .collect::<Vec<_>>();
+    let organization_project_ids = organization_projects
+        .iter()
+        .map(|(_, project_id)| *project_id)
+        .collect::<Vec<_>>();
+
+    for organization_project_team in &organization_project_teams {
+        let new_id = crate::database::models::ids::generate_team_member_id(
+            &mut transaction,
+        )
+        .await
+        .internal_context("fetching query results from database")?;
+        let member = DBTeamMember {
+            id: new_id,
+            team_id: *organization_project_team,
+            user_id: owner_id,
+            role: "Inherited Owner".to_string(),
+            is_owner: true,
+            permissions: ProjectPermissions::all(),
+            organization_permissions: None,
+            accepted: true,
+            payouts_split: Decimal::ZERO,
+            ordering: 0,
+        };
+        member.insert(&mut transaction).await.internal_context(
+            "inserting database records for `organization_delete`",
+        )?;
+    }
+    // Safely remove the organization
+    let result = database::models::DBOrganization::remove(
+        organization.id,
+        &mut transaction,
+        &redis,
+    )
+    .await
+    .internal_context("fetching query results from database")?;
+
+    super::projects::mutation::finalize_mutations(
+        &organization_project_ids,
+        transaction,
+        &pool,
+        &redis,
+        Some(&user),
+    )
+    .await?;
+
+    database::models::DBOrganization::clear_cache(
+        organization.id,
+        Some(organization.slug),
+        &redis,
+    )
+    .await
+    .internal_context("clearing cached data from Redis")?;
+
+    for team_id in &organization_project_teams {
+        database::models::DBTeamMember::clear_cache(*team_id, &redis)
+            .await
+            .internal_context("clearing cached data from Redis")?;
+    }
+
+    for project_id in organization_project_ids {
+        search_state
+            .queue
+            .push_project_change(project_id.into())
+            .await;
+    }
+
+    if !organization_project_teams.is_empty() {
+        database::models::DBUser::clear_project_cache(&[owner_id], &redis)
+            .await
+            .internal_context("clearing cached user in Redis")?;
+    }
+
+    if result.is_some() {
+        Ok(HttpResponse::NoContent().body(""))
+    } else {
+        Err(ApiError::NotFound(anyhow!("resource not found")))
+    }
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct OrganizationProjectAdd {
+    pub project_id: String, // Also allow name/slug
+}
+#[utoipa::path(tag = "organizations", responses((status = NO_CONTENT)))]
+#[post("/organization/{id}/projects")]
+pub async fn organization_projects_add(
+    req: HttpRequest,
+    info: web::Path<(String,)>,
+    project_info: web::Json<OrganizationProjectAdd>,
+    pool: web::Data<PgPool>,
+    redis: web::Data<RedisPool>,
+    session_queue: web::Data<AuthQueue>,
+    search_state: web::Data<SearchState>,
+) -> Result<HttpResponse, ApiError> {
+    let info = info.into_inner().0;
+    let current_user = get_user_from_headers(
+        &req,
+        &**pool,
+        &redis,
+        &session_queue,
+        Scopes::PROJECT_WRITE | Scopes::ORGANIZATION_WRITE,
+    )
+    .await
+    .auth_context("authenticating API request")?;
+
+    let organization =
+        database::models::DBOrganization::get(&info, &**pool, &redis)
+            .await
+            .internal_context("fetching organization from database")?
+            .request_context_with(|| {
+                "the specified organization does not exist!".to_string()
+            })?;
+
+    let mut project_info = project_info.into_inner();
+    crate::routes::resolve_body_refs(
+        vec![&mut project_info.project_id],
+        &Some(current_user.clone()),
+        &pool,
+        &redis,
+    )
+    .await?;
+    let project_item = database::models::DBProject::get(
+        &project_info.project_id,
+        &**pool,
+        &redis,
+    )
+    .await
+    .internal_context("fetching project from database")?
+    .request_context_with(|| {
+        "the specified project does not exist!".to_string()
+    })?;
+    if project_item.inner.organization_id.is_some() {
+        return Err(ApiError::Request(anyhow!(
+            "The specified project is already owned by an organization!",
+        )));
+    }
+
+    let project_team_member =
+        database::models::DBTeamMember::get_from_user_id_project(
+            project_item.inner.id,
+            current_user.user.id.into(),
+            false,
+            &**pool,
+        )
+        .await
+        .internal_context("fetching team member from database")?
+        .request_context_with(|| {
+            "you are not a member of this project!".to_string()
+        })?;
+    let organization_team_member =
+        database::models::DBTeamMember::get_from_user_id_organization(
+            organization.id,
+            current_user.user.id.into(),
+            false,
+            &**pool,
+        )
+        .await
+        .internal_context("fetching team member from database")?
+        .request_context_with(|| {
+            "you are not a member of this organization!".to_string()
+        })?;
+
+    // Require ownership of a project to add it to an organization
+    if !current_user.scopes.contains(Scopes::ADMIN_WRITE)
+        && !project_team_member.is_owner
+    {
+        return Err(ApiError::Auth(anyhow!(
+            "You need to be an owner of a project to add it to an organization!",
+        )));
+    }
+
+    let permissions = OrganizationPermissions::get_permissions_by_scopes(
+        current_user.scopes,
+        &Some(organization_team_member),
+    )
+    .unwrap_or_default();
+    if permissions.contains(OrganizationPermissions::ADD_PROJECT) {
+        let mut transaction = pool
+            .begin()
+            .await
+            .internal_context("starting database transaction")?;
+        sqlx::query!(
+            "
+            UPDATE mods
+            SET organization_id = $1
+            WHERE (id = $2)
+            ",
+            organization.id as database::models::DBOrganizationId,
+            project_item.inner.id as database::models::ids::DBProjectId
+        )
+        .execute(&mut transaction)
+        .await
+        .internal_context(
+            "querying database for `organization_projects_add`",
+        )?;
+
+        // The former owner is no longer an owner (as it is now 'owned' by the organization, 'given' to them)
+        // The former owner is still a member of the project, but not an owner
+        // When later removed from the organization, the project will  be owned by whoever is specified as the new owner there
+
+        let organization_owner_user_id = sqlx::query!(
+            "
+            SELECT u.id
+            FROM team_members
+            INNER JOIN users u ON u.id = team_members.user_id
+            WHERE team_id = $1 AND is_owner = TRUE
+            ",
+            organization.team_id as database::models::ids::DBTeamId
+        )
+        .fetch_one(&mut transaction)
+        .await
+        .internal_context(
+            "fetching organization owner user ID from database",
+        )?;
+        let organization_owner_user_id =
+            database::models::ids::DBUserId(organization_owner_user_id.id);
+
+        sqlx::query!(
+            "
+            DELETE FROM team_members
+            WHERE team_id = $1 AND (is_owner = TRUE OR user_id = $2)
+            ",
+            project_item.inner.team_id as database::models::ids::DBTeamId,
+            organization_owner_user_id as database::models::ids::DBUserId,
+        )
+        .execute(&mut transaction)
+        .await
+        .internal_context(
+            "querying database for `organization_projects_add`",
+        )?;
+
+        super::projects::mutation::finalize_mutation(
+            project_item.inner.id,
+            transaction,
+            &pool,
+            &redis,
+            Some(&current_user),
+        )
+        .await?;
+
+        database::models::DBUser::clear_project_cache(
+            &[current_user.user.id.into()],
+            &redis,
+        )
+        .await
+        .internal_context("clearing cached user in Redis")?;
+        database::models::DBTeamMember::clear_cache(
+            project_item.inner.team_id,
+            &redis,
+        )
+        .await
+        .internal_context("clearing cached data from Redis")?;
+        search_state
+            .queue
+            .push_project_change(project_item.inner.id.into())
+            .await;
+    } else {
+        return Err(ApiError::Auth(anyhow!(
+            "You do not have permission to add projects to this organization!",
+        )));
+    }
+    Ok(HttpResponse::Ok().finish())
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct OrganizationProjectRemoval {
+    // A new owner must be supplied for the project.
+    // That user must be a member of the organization, but not necessarily a member of the project.
+    pub new_owner: UserId,
+}
+
+#[utoipa::path(tag = "organizations", responses((status = NO_CONTENT)))]
+#[delete("/organization/{id}/projects/{project_id}")]
+pub async fn organization_projects_remove(
+    req: HttpRequest,
+    info: web::Path<(String, String)>,
+    pool: web::Data<PgPool>,
+    data: web::Json<OrganizationProjectRemoval>,
+    redis: web::Data<RedisPool>,
+    session_queue: web::Data<AuthQueue>,
+    search_state: web::Data<SearchState>,
+) -> Result<HttpResponse, ApiError> {
+    if let Some(response) = crate::routes::redirect_ref(
+        &req,
+        "project_id",
+        pool.as_ref(),
+        redis.as_ref(),
+        session_queue.as_ref(),
+        Scopes::PROJECT_WRITE | Scopes::ORGANIZATION_WRITE,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+
+    let (organization_id, project_id) = info.into_inner();
+    let current_user = get_user_from_headers(
+        &req,
+        &**pool,
+        &redis,
+        &session_queue,
+        Scopes::PROJECT_WRITE | Scopes::ORGANIZATION_WRITE,
+    )
+    .await
+    .auth_context("authenticating API request")?;
+
+    let organization = database::models::DBOrganization::get(
+        &organization_id,
+        &**pool,
+        &redis,
+    )
+    .await
+    .internal_context("fetching organization from database")?
+    .request_context_with(|| {
+        "the specified organization does not exist!".to_string()
+    })?;
+
+    let project_item =
+        database::models::DBProject::get(&project_id, &**pool, &redis)
+            .await
+            .internal_context("fetching project from database")?
+            .request_context_with(|| {
+                "the specified project does not exist!".to_string()
+            })?;
+
+    if !project_item
+        .inner
+        .organization_id
+        .eq(&Some(organization.id))
+    {
+        return Err(ApiError::Request(anyhow!(
+            "The specified project is not owned by this organization!",
+        )));
+    }
+
+    let organization_team_member =
+        database::models::DBTeamMember::get_from_user_id_organization(
+            organization.id,
+            current_user.user.id.into(),
+            false,
+            &**pool,
+        )
+        .await
+        .internal_context("fetching team member from database")?
+        .request_context_with(|| {
+            "you are not a member of this organization!".to_string()
+        })?;
+
+    let permissions = OrganizationPermissions::get_permissions_by_scopes(
+        current_user.scopes,
+        &Some(organization_team_member),
+    )
+    .unwrap_or_default();
+    if permissions.contains(OrganizationPermissions::REMOVE_PROJECT) {
+        // Now that permissions are confirmed, we confirm the veracity of the new user as an org member
+        database::models::DBTeamMember::get_from_user_id_organization(
+            organization.id,
+            data.new_owner.into(),
+            false,
+            &**pool,
+        )
+        .await
+        .internal_context("deleting team member from database")?
+        .request_context_with(|| {
+            "the specified user is not a member of this organization!"
+                .to_string()
+        })?;
+
+        // Then, we get the team member of the project and that user (if it exists)
+        // We use the team member get directly
+        let new_owner =
+            database::models::DBTeamMember::get_from_user_id_project(
+                project_item.inner.id,
+                data.new_owner.into(),
+                true,
+                &**pool,
+            )
+            .await
+            .internal_context("fetching team member from database")?;
+
+        let mut transaction = pool
+            .begin()
+            .await
+            .internal_context("starting database transaction")?;
+
+        // If the user is not a member of the project, we add them
+        let new_owner = match new_owner {
+            Some(new_owner) => new_owner,
+            None => {
+                let new_id =
+                    crate::database::models::ids::generate_team_member_id(
+                        &mut transaction,
+                    )
+                    .await
+                    .internal_context("generating team member ID")?;
+                let member = DBTeamMember {
+                    id: new_id,
+                    team_id: project_item.inner.team_id,
+                    user_id: data.new_owner.into(),
+                    role: "Inherited Owner".to_string(),
+                    is_owner: false,
+                    permissions: ProjectPermissions::all(),
+                    organization_permissions: None,
+                    accepted: true,
+                    payouts_split: Decimal::ZERO,
+                    ordering: 0,
+                };
+                member
+                    .insert(&mut transaction)
+                    .await
+                    .internal_context("inserting database records for `organization_projects_remove`")?;
+                member
+            }
+        };
+
+        // Set the new owner to fit owner
+        sqlx::query!(
+            "
+            UPDATE team_members
+            SET
+                is_owner = TRUE,
+                accepted = TRUE,
+                permissions = $2,
+                organization_permissions = NULL,
+                role = 'Inherited Owner'
+            WHERE (id = $1)
+            ",
+            new_owner.id as database::models::ids::DBTeamMemberId,
+            ProjectPermissions::all().bits() as i64
+        )
+        .execute(&mut transaction)
+        .await
+        .internal_context(
+            "querying database for `organization_projects_remove`",
+        )?;
+
+        sqlx::query!(
+            "
+            UPDATE mods
+            SET organization_id = NULL
+            WHERE (id = $1)
+            ",
+            project_item.inner.id as database::models::ids::DBProjectId
+        )
+        .execute(&mut transaction)
+        .await
+        .internal_context(
+            "querying database for `organization_projects_remove`",
+        )?;
+
+        super::projects::mutation::finalize_mutation(
+            project_item.inner.id,
+            transaction,
+            &pool,
+            &redis,
+            Some(&current_user),
+        )
+        .await?;
+        database::models::DBUser::clear_project_cache(
+            &[current_user.user.id.into()],
+            &redis,
+        )
+        .await
+        .internal_context("clearing cached user in Redis")?;
+        database::models::DBTeamMember::clear_cache(
+            project_item.inner.team_id,
+            &redis,
+        )
+        .await
+        .internal_context("clearing cached data from Redis")?;
+        search_state
+            .queue
+            .push_project_change(project_item.inner.id.into())
+            .await;
+    } else {
+        return Err(ApiError::Auth(anyhow!(
+            "You do not have permission to add projects to this organization!",
+        )));
+    }
+    Ok(HttpResponse::Ok().finish())
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Extension {
+    pub ext: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+#[utoipa::path(
+	tag = "organizations",
+	params(("ext" = String, Query)),
+	request_body(content = Vec<u8>, content_type = "application/octet-stream"),
+	responses((status = NO_CONTENT))
+)]
+#[patch("/organization/{id}/icon")]
+pub async fn organization_icon_edit(
+    web::Query(ext): web::Query<Extension>,
+    req: HttpRequest,
+    info: web::Path<(String,)>,
+    pool: web::Data<PgPool>,
+    redis: web::Data<RedisPool>,
+    file_host: web::Data<dyn FileHost>,
+    mut payload: web::Payload,
+    session_queue: web::Data<AuthQueue>,
+) -> Result<HttpResponse, ApiError> {
+    let user = get_user_from_headers(
+        &req,
+        &**pool,
+        &redis,
+        &session_queue,
+        Scopes::ORGANIZATION_WRITE,
+    )
+    .await
+    .auth_context("authenticating API request")?;
+    let string = info.into_inner().0;
+
+    let organization_item =
+        database::models::DBOrganization::get(&string, &**pool, &redis)
+            .await
+            .internal_context("fetching organization from database")?
+            .request_context_with(|| {
+                "the specified organization does not exist!".to_string()
+            })?;
+
+    if !user.scopes.contains(Scopes::MODERATION_WRITE) {
+        let team_member = database::models::DBTeamMember::get_from_user_id(
+            organization_item.team_id,
+            user.user.id.into(),
+            &**pool,
+        )
+        .await
+        .internal_context("fetching organization team member")?;
+
+        let permissions = OrganizationPermissions::get_permissions_by_scopes(
+            user.scopes,
+            &team_member,
+        )
+        .unwrap_or_default();
+
+        if !permissions.contains(OrganizationPermissions::EDIT_DETAILS) {
+            return Err(ApiError::Auth(anyhow!(
+                "You don't have permission to edit this organization's icon.",
+            )));
+        }
+    }
+
+    delete_old_images(
+        organization_item.icon_url,
+        organization_item.raw_icon_url,
+        FileHostPublicity::Public,
+        &**file_host,
+    )
+    .await
+    .api_context("deleting old images")?;
+
+    let bytes = read_limited_from_payload(
+        &mut payload,
+        GLOBALS.max_organization_icon_size,
+        format!(
+            "icons must be smaller than {}",
+            humansize::format_size(
+                GLOBALS.max_organization_icon_size,
+                humansize::BINARY
+            )
+        ),
+    )
+    .await?;
+
+    let organization_id: OrganizationId = organization_item.id.into();
+    let upload_result = crate::util::img::upload_image_optimized(
+        &format!("data/{organization_id}"),
+        FileHostPublicity::Public,
+        bytes.freeze(),
+        &ext.ext,
+        Some(96),
+        Some(1.0),
+        &**file_host,
+    )
+    .await
+    .api_context("uploading image")?;
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .internal_context("starting database transaction")?;
+
+    sqlx::query!(
+        "
+        UPDATE organizations
+        SET icon_url = $1, raw_icon_url = $2, color = $3
+        WHERE (id = $4)
+        ",
+        upload_result.url,
+        upload_result.raw_url,
+        upload_result.color.map(|x| x as i32),
+        organization_item.id as database::models::ids::DBOrganizationId,
+    )
+    .execute(&mut transaction)
+    .await
+    .internal_context("querying database for `organization_icon_edit`")?;
+
+    transaction
+        .commit()
+        .await
+        .internal_context("committing database transaction")?;
+    database::models::DBOrganization::clear_cache(
+        organization_item.id,
+        Some(organization_item.slug),
+        &redis,
+    )
+    .await
+    .internal_context("clearing cached data from Redis")?;
+
+    Ok(HttpResponse::NoContent().body(""))
+}
+
+#[utoipa::path(tag = "organizations", responses((status = NO_CONTENT)))]
+#[delete("/organization/{id}/icon")]
+pub async fn delete_organization_icon(
+    req: HttpRequest,
+    info: web::Path<(String,)>,
+    pool: web::Data<PgPool>,
+    redis: web::Data<RedisPool>,
+    file_host: web::Data<dyn FileHost>,
+    session_queue: web::Data<AuthQueue>,
+) -> Result<HttpResponse, ApiError> {
+    let user = get_user_from_headers(
+        &req,
+        &**pool,
+        &redis,
+        &session_queue,
+        Scopes::ORGANIZATION_WRITE,
+    )
+    .await
+    .auth_context("authenticating API request")?;
+    let string = info.into_inner().0;
+
+    let organization_item =
+        database::models::DBOrganization::get(&string, &**pool, &redis)
+            .await
+            .internal_context("fetching organization from database")?
+            .request_context_with(|| {
+                "the specified organization does not exist!".to_string()
+            })?;
+
+    if !user.scopes.contains(Scopes::MODERATION_WRITE) {
+        let team_member = database::models::DBTeamMember::get_from_user_id(
+            organization_item.team_id,
+            user.user.id.into(),
+            &**pool,
+        )
+        .await
+        .internal_context("fetching organization team member")?;
+
+        let permissions = OrganizationPermissions::get_permissions_by_scopes(
+            user.scopes,
+            &team_member,
+        )
+        .unwrap_or_default();
+
+        if !permissions.contains(OrganizationPermissions::EDIT_DETAILS) {
+            return Err(ApiError::Auth(anyhow!(
+                "You don't have permission to edit this organization's icon.",
+            )));
+        }
+    }
+
+    delete_old_images(
+        organization_item.icon_url,
+        organization_item.raw_icon_url,
+        FileHostPublicity::Public,
+        &**file_host,
+    )
+    .await
+    .api_context("deleting old images")?;
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .internal_context("starting database transaction")?;
+
+    sqlx::query!(
+        "
+        UPDATE organizations
+        SET icon_url = NULL, raw_icon_url = NULL, color = NULL
+        WHERE (id = $1)
+        ",
+        organization_item.id as database::models::ids::DBOrganizationId,
+    )
+    .execute(&mut transaction)
+    .await
+    .internal_context("querying database for `delete_organization_icon`")?;
+
+    transaction
+        .commit()
+        .await
+        .internal_context("committing database transaction")?;
+
+    database::models::DBOrganization::clear_cache(
+        organization_item.id,
+        Some(organization_item.slug),
+        &redis,
+    )
+    .await
+    .internal_context("clearing cached data from Redis")?;
+
+    Ok(HttpResponse::NoContent().body(""))
+}

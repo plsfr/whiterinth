@@ -1,0 +1,127 @@
+<template>
+	<NuxtPage v-if="route.name === 'moderation-project-review'" />
+	<div
+		v-else
+		class="relative mx-auto mb-6 mt-4 flex min-h-screen w-full max-w-[1280px] flex-col px-6"
+	>
+		<h1 class="mb-4 mt-0 text-3xl font-semibold">Moderation</h1>
+		<NavTabs :links="moderationLinks" class="mb-4 hidden sm:flex" />
+		<div class="mb-4 sm:hidden">
+			<Chips
+				v-model="selectedChip"
+				:items="mobileNavOptions"
+				:never-empty="true"
+				@change="navigateToPage"
+			/>
+		</div>
+		<NuxtPage />
+	</div>
+</template>
+
+<script setup lang="ts">
+import { FolderIcon, GlobeIcon, HashIcon, ReportIcon, SettingsIcon } from '@modrinth/assets'
+import { Chips, defineMessages, NavTabs, useVIntl } from '@modrinth/ui'
+
+definePageMeta({
+	middleware: ['auth', 'staff'],
+})
+
+useSeoMeta({
+	robots: 'noindex',
+})
+
+const { formatMessage } = useVIntl()
+const route = useRoute()
+const router = useRouter()
+
+const messages = defineMessages({
+	projectsTitle: {
+		id: 'moderation.page.projects',
+		defaultMessage: 'Projects',
+	},
+	reportsTitle: {
+		id: 'moderation.page.reports',
+		defaultMessage: 'Reports',
+	},
+	externalFilesTitle: {
+		id: 'moderation.page.external-projects',
+		defaultMessage: 'External projects',
+	},
+	globalDetailTracesTitle: {
+		id: 'moderation.page.global-detail-traces',
+		defaultMessage: 'Global traces',
+	},
+	delphiRulesTitle: {
+		id: 'moderation.page.delphi-rules',
+		defaultMessage: 'Delphi rules',
+	},
+})
+
+const moderationLinks = [
+	{ label: formatMessage(messages.projectsTitle), href: '/moderation', icon: FolderIcon },
+	{ label: formatMessage(messages.reportsTitle), href: '/moderation/reports', icon: ReportIcon },
+	{
+		label: formatMessage(messages.externalFilesTitle),
+		href: '/moderation/external-projects',
+		icon: GlobeIcon,
+	},
+	{
+		label: formatMessage(messages.globalDetailTracesTitle),
+		href: '/moderation/global-traces',
+		icon: HashIcon,
+	},
+	{
+		label: formatMessage(messages.delphiRulesTitle),
+		href: '/moderation/technical-review/rules',
+		icon: SettingsIcon,
+	},
+	{ label: 'Project flag rules', href: '/moderation/project-flag', icon: SettingsIcon },
+]
+
+const mobileNavOptions = [
+	formatMessage(messages.projectsTitle),
+	formatMessage(messages.reportsTitle),
+	formatMessage(messages.externalFilesTitle),
+	formatMessage(messages.globalDetailTracesTitle),
+	formatMessage(messages.delphiRulesTitle),
+	'Project flag rules',
+]
+
+const selectedChip = computed({
+	get() {
+		const path = route.path
+		if (path.startsWith('/moderation/technical-review/rules')) {
+			return formatMessage(messages.delphiRulesTitle)
+		} else if (path.startsWith('/moderation/project-flag')) {
+			return 'Project flag rules'
+		} else if (path.startsWith('/moderation/reports')) {
+			return formatMessage(messages.reportsTitle)
+		} else if (path.startsWith('/moderation/external-projects')) {
+			return formatMessage(messages.externalFilesTitle)
+		} else if (path.startsWith('/moderation/global-traces')) {
+			return formatMessage(messages.globalDetailTracesTitle)
+		} else {
+			return formatMessage(messages.projectsTitle)
+		}
+	},
+	set(value: string) {
+		navigateToPage(value)
+	},
+})
+
+function navigateToPage(selectedOption: string) {
+	if (selectedOption === formatMessage(messages.reportsTitle)) {
+		router.push('/moderation/reports')
+	} else if (selectedOption === formatMessage(messages.externalFilesTitle)) {
+		router.push('/moderation/external-projects')
+	} else if (selectedOption === formatMessage(messages.globalDetailTracesTitle)) {
+		router.push('/moderation/global-traces')
+	} else if (selectedOption === formatMessage(messages.delphiRulesTitle)) {
+		router.push('/moderation/technical-review/rules')
+	} else if (selectedOption === 'Project flag rules') {
+		router.push('/moderation/project-flag')
+	} else {
+		router.push('/moderation')
+	}
+}
+</script>

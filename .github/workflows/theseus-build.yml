@@ -1,0 +1,277 @@
+name: Modrinth App build
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+    paths:
+      - .github/workflows/theseus-build.yml
+      - 'apps/app/**'
+      - 'apps/app-frontend/**'
+      - 'packages/app-lib/**'
+      - 'packages/app-macros/**'
+      - 'packages/assets/**'
+      - 'packages/ui/**'
+      - 'packages/utils/**'
+  workflow_dispatch:
+    inputs:
+      sign-macos-binaries:
+        description: Sign macOS binaries
+        type: boolean
+        default: true
+        required: false
+      sign-windows-binaries:
+        description: Sign Windows binaries
+        type: boolean
+        default: false
+        required: false
+      environment:
+        description: Environment
+        type: choice
+        options:
+          - prod
+          - staging
+          - prod-with-staging-archon
+        default: prod
+        required: false
+      app-version-override:
+        description: Temporary app version override for updater testing
+        type: string
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/prod' }}
+
+env:
+  TURBO_TELEMETRY_DISABLED: 1
+  pnpm_config_color: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact-target-name }})
+    env:
+      VITE_STRIPE_PUBLISHABLE_KEY: pk_live_51JbFxJJygY5LJFfKLVVldb10HlLt24p421OWRsTOWc5sXYFOnFUXWieSc6HD3PHo25ktx8db1WcHr36XGFvZFVUz00V9ixrCs5
+      RUSTC_WRAPPER: 'sccache'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: namespace-profile-modrinth-app-macos
+            artifact-target-name: universal-apple-darwin
+            rust-target: x86_64-apple-darwin
+          - platform: namespace-profile-modrinth-app-windows
+            artifact-target-name: x86_64-pc-windows-msvc
+          - platform: namespace-profile-modrinth-app-windows-arm64
+            artifact-target-name: aarch64-pc-windows-msvc
+            rust-target: aarch64-pc-windows-msvc
+            tauri-target-args: --target aarch64-pc-windows-msvc
+          - platform: namespace-profile-modrinth-app-linux
+            artifact-target-name: x86_64-unknown-linux-gnu
+          - platform: namespace-profile-modrinth-app-linux-arm64
+            artifact-target-name: aarch64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Check out code
+        uses: namespacelabs/nscloud-checkout-action@66f2dc6f6c42a8ac6c4e53473c4840006822831e # v9.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          rustflags: ''
+          build-warnings: ''
+          target: ${{ matrix.rust-target }}
+          cache: false
+
+      - name: Setup mold
+        if: contains(matrix.artifact-target-name, 'linux')
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1 / Mold 3.0.0
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Set up caches
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
+        with:
+          cache: |
+            rust
+            pnpm
+
+      - name: Configure sccache
+        shell: bash
+        run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
+
+      - name: Remove bundles restored from cache
+        shell: bash
+        run: rm -rf target/*/bundle target/*/*/bundle
+
+      - name: Generate tauri-dev.conf.json
+        shell: bash
+        run: |
+          GIT_HASH=$(git rev-parse --short HEAD)
+          cat > apps/app/tauri-dev.conf.json <<EOF
+          {
+            "productName": "Modrinth App (dev-${GIT_HASH})",
+            "mainBinaryName": "Modrinth App (dev-${GIT_HASH})",
+            "identifier": "ModrinthApp-dev-${GIT_HASH}",
+            "bundle": {
+              "fileAssociations": []
+            }
+          }
+          EOF
+
+      - name: Install Linux build dependencies
+        if: contains(matrix.artifact-target-name, 'linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Setup Java
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Dasel
+        uses: jaxxstorm/action-install-gh-release@b82b2052fdf822192f2119b7e289a6f63e668bc8 # v4.0.0
+        with:
+          repo: TomWright/dasel
+          tag: v2.8.1
+          extension-matching: disable
+          rename-to: ${{ contains(matrix.artifact-target-name, 'windows') && 'dasel.exe' || 'dasel' }}
+          chmod: 0755
+
+      - name: Set application version and environment
+        shell: bash
+        run: |
+          APP_VERSION="${{ inputs.app-version-override }}"
+          if [ -z "$APP_VERSION" ]; then
+            APP_VERSION="$(git describe --tags --always | sed -E 's/-([0-9]+)-(g[0-9a-fA-F]+)$/-canary+\1.\2/')"
+          fi
+          BUILD_ENVIRONMENT="${{ inputs.environment || 'prod' }}"
+          echo "Setting application version to $APP_VERSION"
+          echo "Using environment $BUILD_ENVIRONMENT"
+          dasel put -f apps/app/Cargo.toml -t string -v "${APP_VERSION#v}" 'package.version'
+          dasel put -f packages/app-lib/Cargo.toml -t string -v "${APP_VERSION#v}" 'package.version'
+          dasel put -f apps/app-frontend/package.json -t string -v "${APP_VERSION#v}" 'version'
+
+          cp "packages/app-lib/.env.${BUILD_ENVIRONMENT}" packages/app-lib/.env
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Set up Windows code signing
+        if: contains(matrix.artifact-target-name, 'windows')
+        shell: bash
+        run: |
+          if [ '${{ startsWith(github.ref, 'refs/tags/v') || inputs.sign-windows-binaries }}' = 'true' ]; then
+            choco install jsign --ignore-dependencies # GitHub runners come with a global Java installation already
+          else
+            dasel delete -f apps/app/tauri-release.conf.json 'bundle.windows.signCommand'
+          fi
+
+      - name: Build signed macOS app
+        run: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || inputs.app-version-override != '') && 'pnpm --filter=@modrinth/app run tauri build --target universal-apple-darwin --config tauri-release.conf.json' || 'pnpm --filter=@modrinth/app run tauri build --target universal-apple-darwin --config tauri-dev.conf.json -- --profile release-with-thin-lto' }}
+        if: contains(matrix.artifact-target-name, 'darwin') && (github.event_name != 'workflow_dispatch' || inputs.sign-macos-binaries)
+        env:
+          TAURI_BUNDLER_DMG_IGNORE_CI: 'true'
+          ENABLE_CODE_SIGNING: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+
+      - name: Build unsigned macOS app
+        run: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || inputs.app-version-override != '') && 'pnpm --filter=@modrinth/app run tauri build --target universal-apple-darwin --config tauri-release.conf.json' || 'pnpm --filter=@modrinth/app run tauri build --target universal-apple-darwin --config tauri-dev.conf.json -- --profile release-with-thin-lto' }}
+        if: contains(matrix.artifact-target-name, 'darwin') && github.event_name == 'workflow_dispatch' && !inputs.sign-macos-binaries
+        env:
+          TAURI_BUNDLER_DMG_IGNORE_CI: 'true'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+
+      - name: Build Linux app
+        run: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || inputs.app-version-override != '') && 'pnpm --filter=@modrinth/app run tauri build --config tauri-release.conf.json' || 'pnpm --filter=@modrinth/app run tauri build --config tauri-dev.conf.json -- --profile release-with-thin-lto' }}
+        if: contains(matrix.artifact-target-name, 'linux')
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+
+      - name: Build Windows app
+        run: |
+          [System.Convert]::FromBase64String("$env:DIGICERT_ONE_SIGNER_CLIENT_CERTIFICATE_BASE64") | Set-Content -Path signer-client-cert.p12 -AsByteStream
+          $env:DIGICERT_ONE_SIGNER_CREDENTIALS = "$env:DIGICERT_ONE_SIGNER_API_KEY|$PWD\signer-client-cert.p12|$env:DIGICERT_ONE_SIGNER_CLIENT_CERTIFICATE_PASSWORD"
+          $env:JAVA_HOME = "$env:JAVA_HOME_17_X64"
+          ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || inputs.app-version-override != '') && format('pnpm --filter=@modrinth/app run tauri build {0} --config tauri-release.conf.json --verbose --bundles "nsis,updater"', matrix.tauri-target-args) || format('pnpm --filter=@modrinth/app run tauri build {0} --config tauri-dev.conf.json --verbose --bundles "nsis,updater" ''--'' --profile release-with-thin-lto', matrix.tauri-target-args) }}
+          Remove-Item -Path signer-client-cert.p12 -ErrorAction SilentlyContinue
+        if: contains(matrix.artifact-target-name, 'windows')
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          DIGICERT_ONE_SIGNER_API_KEY: ${{ secrets.DIGICERT_ONE_SIGNER_API_KEY }}
+          DIGICERT_ONE_SIGNER_CLIENT_CERTIFICATE_BASE64: ${{ secrets.DIGICERT_ONE_SIGNER_CLIENT_CERTIFICATE_BASE64 }}
+          DIGICERT_ONE_SIGNER_CLIENT_CERTIFICATE_PASSWORD: ${{ secrets.DIGICERT_ONE_SIGNER_CLIENT_CERTIFICATE_PASSWORD }}
+
+      - name: Upload app bundles
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: App bundle (${{ matrix.artifact-target-name }})
+          path: |
+            target/release/bundle/appimage/Modrinth App_*.AppImage*
+            target/release/bundle/deb/Modrinth App_*.deb*
+            target/release/bundle/rpm/Modrinth App-*.rpm*
+            target/release-with-thin-lto/bundle/appimage/Modrinth App (dev-*)_*.AppImage*
+            target/release-with-thin-lto/bundle/deb/Modrinth App (dev-*)_*.deb*
+            target/release-with-thin-lto/bundle/rpm/Modrinth App (dev-*)-*.rpm*
+            target/universal-apple-darwin/release/bundle/macos/Modrinth App.app.tar.gz*
+            target/universal-apple-darwin/release-with-thin-lto/bundle/macos/Modrinth App (dev-*)*.app.tar.gz
+            target/universal-apple-darwin/release-with-thin-lto/bundle/dmg/Modrinth App (dev-*)*.dmg
+            target/universal-apple-darwin/release/bundle/dmg/Modrinth App_*.dmg*
+            target/release/bundle/nsis/Modrinth App_*-setup.exe*
+            target/release-with-thin-lto/bundle/nsis/Modrinth App (dev-*)_*-setup.exe*
+            target/release/bundle/nsis/Modrinth App_*-setup.nsis.zip*
+            target/aarch64-pc-windows-msvc/release/bundle/nsis/Modrinth App_*-setup.exe*
+            target/aarch64-pc-windows-msvc/release-with-thin-lto/bundle/nsis/Modrinth App (dev-*)_*-setup.exe*
+            target/aarch64-pc-windows-msvc/release/bundle/nsis/Modrinth App_*-setup.nsis.zip*
+
+      - name: Remove bundles from cached target directory
+        if: always()
+        shell: bash
+        run: rm -rf target/*/bundle target/*/*/bundle
+
+  notify:
+    name: Notify Slack
+    needs: build
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' }}
+    runs-on: namespace-profile-tiny-arm64
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Send Slack notification
+        run: node .github/scripts/notify-app-build.mjs
+        env:
+          BUILD_ENVIRONMENT: ${{ inputs.environment || 'prod' }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_APP_BUILDS_WEBHOOK_URL }}
