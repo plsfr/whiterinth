@@ -5,7 +5,7 @@
 <p><strong>A monochrome fork of Modrinth App.</strong></p>
 
 <p>
-  <a href="https://github.com/modrinth/code/releases/tag/v0.23.5"><img alt="Based on Modrinth App v0.23.5" src="https://img.shields.io/badge/Modrinth%20App-v0.23.5-555555?style=flat-square"></a>
+  <a href="https://github.com/modrinth/code/releases/tag/v0.23.4"><img alt="Based on Modrinth App v0.23.4" src="https://img.shields.io/badge/Modrinth%20App-v0.23.4-555555?style=flat-square"></a>
   <img alt="Built with Tauri" src="https://img.shields.io/badge/Tauri-desktop%20app-555555?style=flat-square">
   <img alt="Rust" src="https://img.shields.io/badge/backend-Rust-555555?style=flat-square">
   <img alt="Vue" src="https://img.shields.io/badge/frontend-Vue-555555?style=flat-square">
@@ -21,7 +21,7 @@
 
 ---
 
-Whiterinth is an unofficial fork of [Modrinth App](https://github.com/modrinth/code), based on the latest upstream release, **v0.23.5**. It is independently maintained and is not affiliated with or endorsed by Modrinth.
+Whiterinth is an unofficial fork of [Modrinth App](https://github.com/modrinth/code), based on upstream version **v0.23.4**. It is independently maintained and is not affiliated with or endorsed by Modrinth.
 
 ## Changes
 
