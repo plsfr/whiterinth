@@ -2,30 +2,44 @@
 
 <h1>Whiterinth</h1>
 
-<p><strong>A monochrome Minecraft launcher based on Modrinth App.</strong></p>
+<p><strong>A stripped-back, monochrome fork of Modrinth App.</strong></p>
 
 <p>
-  <a href="https://github.com/modrinth/code"><img alt="Upstream: modrinth/code" src="https://img.shields.io/badge/upstream-modrinth%2Fcode-303030?style=flat-square"></a>
-  <img alt="Interface: grayscale" src="https://img.shields.io/badge/interface-grayscale-585858?style=flat-square">
-  <img alt="Build guide: Windows x64" src="https://img.shields.io/badge/build%20guide-Windows%20x64-707070?style=flat-square">
+  <a href="https://github.com/modrinth/code/releases/tag/v0.23.5"><img alt="Based on Modrinth App v0.23.5" src="https://img.shields.io/badge/Modrinth%20App-v0.23.5-555555?style=flat-square"></a>
+  <img alt="Monochrome interface" src="https://img.shields.io/badge/interface-monochrome-555555?style=flat-square">
+  <img alt="Advertising removed" src="https://img.shields.io/badge/advertising-removed-555555?style=flat-square">
+  <img alt="Minimal launcher" src="https://img.shields.io/badge/launcher-minimal-555555?style=flat-square">
 </p>
 
-<a href="#install-on-windows">Install</a> · <a href="#build-from-source">Build from source</a> · <a href="#credits-and-licensing">Credits &amp; licensing</a>
+<p>
+  <a href="#what-is-whiterinth">About</a> ·
+  <a href="#what-changed">What changed</a> ·
+  <a href="#install-on-windows">Install</a> ·
+  <a href="#build-from-source">Build from source</a> ·
+  <a href="#credits-and-licensing">Credits &amp; licensing</a>
+</p>
 
 </div>
 
 ---
 
 > [!NOTE]
-> **Whiterinth is an unofficial modified fork of Modrinth App.** It is independently maintained and has no official affiliation with or endorsement from Modrinth. [Original Modrinth repository](https://github.com/modrinth/code)
+> Whiterinth is an unofficial, independently maintained fork of [Modrinth App](https://github.com/modrinth/code). It is not affiliated with or endorsed by Modrinth.
+
+## What is Whiterinth?
+
+Whiterinth is a minimal, monochrome take on the Modrinth launcher, based on the official **Modrinth App v0.23.5** — the latest upstream release at the time of writing.
+
+The interface uses a consistent grayscale palette across its panels and surfaces. Advertising and extra sidebar content are removed, leaving a cleaner launcher focused on managing and playing Minecraft.
 
 ## What changed
 
-- **Monochrome throughout the launcher.** A single grayscale filter covers the desktop interface, including in-app menus, dialogs, and images loaded at runtime. Native system dialogs and external sign-in pages render separately.
-- **Fewer promotional interruptions.** The fork removes the embedded ad view, sidebar ads and upsells, ad consent and reporting, and the external survey widget.
-- **Its own app identity.** The window, executable, and installer use the Whiterinth name. Launcher data is stored separately under `org.whiterinth.launcher`.
+- **Monochrome interface.** App panels and UI surfaces use a grayscale palette throughout.
+- **Advertising removed.** In-app advertising visuals have been removed.
+- **Hosting shortcut removed.** The Modrinth Hosting button is no longer shown in the left sidebar.
+- **News column removed.** The launcher no longer displays the news column.
 
-The launcher retains Modrinth service integrations and the familiar workflows for browsing content, managing Minecraft instances, and launching the game. Whiterinth registers the `modrinth:` protocol and `.mrpack` files, so you can choose the default handler in Windows if you have both launchers installed.
+The project keeps the familiar Modrinth App foundation and its core launcher experience.
 
 ## Install on Windows
 
@@ -64,6 +78,6 @@ The default installer output directory is `target/release/bundle/nsis/`.
 
 ## Credits and licensing
 
-Thanks to the Modrinth developers and contributors who built the original launcher and its shared libraries. [Modrinth source code](https://github.com/modrinth/code)
+Whiterinth is built on the work of the Modrinth developers and contributors. See the [official Modrinth App source](https://github.com/modrinth/code).
 
-The applicable terms are defined per package. See the [copying and branding guidelines](COPYING.md), [desktop license](apps/app/LICENSE), [frontend license](apps/app-frontend/LICENSE), and [third-party notices](THIRD-PARTY-NOTICES.md).
+Licensing terms vary by package. See the [copying and branding guidelines](COPYING.md), [desktop license](apps/app/LICENSE), [frontend license](apps/app-frontend/LICENSE), and [third-party notices](THIRD-PARTY-NOTICES.md).
